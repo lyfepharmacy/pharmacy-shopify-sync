@@ -6,12 +6,10 @@ SHOPIFY_ACCESS_TOKEN = os.environ.get("SHOPIFY_ACCESS_TOKEN")
 SHOPIFY_STORE_DOMAIN = os.environ.get("SHOPIFY_STORE_DOMAIN")
 API_URL = "http://137.59.222.96:8085/myapi/LocationWiseProductInventory"
 
-# Basic verification of Secrets
 if not SHOPIFY_ACCESS_TOKEN or not SHOPIFY_STORE_DOMAIN:
     print("ERROR: SHOPIFY_ACCESS_TOKEN or SHOPIFY_STORE_DOMAIN environment variables are missing!")
     exit(1)
 
-# Clean domain if user accidentally added https://
 SHOPIFY_STORE_DOMAIN = SHOPIFY_STORE_DOMAIN.replace("https://", "").replace("http://", "").strip("/")
 
 HEADERS = {
@@ -19,18 +17,8 @@ HEADERS = {
     "Content-Type": "application/json"
 }
 
-def get_shopify_location_id():
-    url = f"https://{SHOPIFY_STORE_DOMAIN}/admin/api/2024-01/locations.json"
-    res = requests.get(url, headers=HEADERS)
-    
-    if res.status_code != 200:
-        print(f"Failed to connect to Shopify. Status Code: {res.status_code}, Response: {res.text}")
-        raise Exception("Shopify authentication failed. Check your SHOPIFY_ACCESS_TOKEN.")
-
-    locations = res.json().get('locations', [])
-    if locations:
-        return locations[0]['id']
-    raise Exception("No active locations found in Shopify.")
+# Auto-detected location cache
+CACHED_LOCATION_ID = None
 
 def get_all_shopify_products():
     products = {}
@@ -53,7 +41,6 @@ def get_all_shopify_products():
                     'inventory_item_id': variant['inventory_item_id']
                 }
         
-        # Handle Shopify Pagination
         link_header = res.headers.get('Link', '')
         url = None
         if 'rel="next"' in link_header:
@@ -82,16 +69,31 @@ def parse_qty(val):
     except (ValueError, TypeError):
         return 0
 
-def update_stock(inventory_item_id, location_id, qty):
+def update_stock(inventory_item_id, qty):
+    global CACHED_LOCATION_ID
+
+    # Auto-detect location ID directly from existing item (uses read_inventory scope)
+    if not CACHED_LOCATION_ID:
+        inv_url = f"https://{SHOPIFY_STORE_DOMAIN}/admin/api/2024-01/inventory_levels.json?inventory_item_ids={inventory_item_id}"
+        inv_res = requests.get(inv_url, headers=HEADERS)
+        if inv_res.status_code == 200:
+            levels = inv_res.json().get('inventory_levels', [])
+            if levels:
+                CACHED_LOCATION_ID = levels[0]['location_id']
+
+    if not CACHED_LOCATION_ID:
+        print(f"Could not update inventory for item {inventory_item_id}: Location not found.")
+        return
+
     url = f"https://{SHOPIFY_STORE_DOMAIN}/admin/api/2024-01/inventory_levels/set.json"
     payload = {
-        "location_id": location_id,
+        "location_id": CACHED_LOCATION_ID,
         "inventory_item_id": inventory_item_id,
         "available": parse_qty(qty)
     }
     requests.post(url, headers=HEADERS, json=payload)
 
-def create_draft_product(item, location_id):
+def create_draft_product(item):
     url = f"https://{SHOPIFY_STORE_DOMAIN}/admin/api/2024-01/products.json"
     stock_qty = parse_qty(item.get('LocationStock', 0))
     price = str(item.get('ProductSalePrice', '0.00')).strip()
@@ -115,16 +117,12 @@ def create_draft_product(item, location_id):
 
 def main():
     print("--- STARTING PHARMACY TO SHOPIFY SYNC ---")
-    
-    # 1. Test Shopify Connection & Location
-    shopify_loc_id = get_shopify_location_id()
-    print(f" Connected to Shopify. Location ID: {shopify_loc_id}")
 
-    # 2. Fetch Existing Shopify Products
+    # 1. Fetch Existing Shopify Products
     shopify_products = get_all_shopify_products()
     print(f" Loaded {len(shopify_products)} existing products from Shopify.")
 
-    # 3. Fetch Pharmacy API Items
+    # 2. Fetch Pharmacy API Items
     pharmacy_items = get_pharmacy_data()
     print(f" Fetched {len(pharmacy_items)} product records from Pharmacy API.")
 
@@ -136,9 +134,8 @@ def main():
     created_count = 0
     new_products_list = []
 
-    # 4. Process Sync
+    # 3. Process Sync (Filtered for HEAD OFFICE / LocationId 1)
     for item in pharmacy_items:
-        # Strict filter for HEAD OFFICE (LocationId 1)
         if str(item.get('LocationId', '')).strip() != "1":
             continue
 
@@ -151,14 +148,13 @@ def main():
 
         if clean_name in shopify_products:
             inv_item_id = shopify_products[clean_name]['inventory_item_id']
-            update_stock(inv_item_id, shopify_loc_id, stock)
+            update_stock(inv_item_id, stock)
             updated_count += 1
         else:
-            success = create_draft_product(item, shopify_loc_id)
+            success = create_draft_product(item)
             if success:
                 created_count += 1
                 new_products_list.append(name)
-                # Cache to prevent duplicates in loop
                 shopify_products[clean_name] = {}
 
     print("\n================ SYNC SUMMARY ================")
