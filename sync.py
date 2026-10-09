@@ -6,6 +6,8 @@ import time
 import requests
 
 SHOPIFY_ACCESS_TOKEN = os.environ.get("SHOPIFY_ACCESS_TOKEN")
+SHOPIFY_CLIENT_ID = os.environ.get("SHOPIFY_CLIENT_ID")
+SHOPIFY_CLIENT_SECRET = os.environ.get("SHOPIFY_CLIENT_SECRET")
 SHOPIFY_STORE_DOMAIN = os.environ.get("SHOPIFY_STORE_DOMAIN")
 API_URL = "http://137.59.222.96:8085/myapi/LocationWiseProductInventory"
 
@@ -13,16 +15,45 @@ API_VERSION = "2024-01"
 WRITE_DELAY = 0.5
 DRY_RUN = os.environ.get("DRY_RUN", "").strip().lower() in ("1", "true", "yes")
 
-if not SHOPIFY_ACCESS_TOKEN or not SHOPIFY_STORE_DOMAIN:
-    print("ERROR: SHOPIFY_ACCESS_TOKEN or SHOPIFY_STORE_DOMAIN environment variables are missing")
+if not SHOPIFY_STORE_DOMAIN:
+    print("ERROR: SHOPIFY_STORE_DOMAIN environment variable is missing")
     sys.exit(1)
 
 SHOPIFY_STORE_DOMAIN = SHOPIFY_STORE_DOMAIN.replace("https://", "").replace("http://", "").strip("/")
 BASE = "https://%s/admin/api/%s" % (SHOPIFY_STORE_DOMAIN, API_VERSION)
-HEADERS = {
-    "X-Shopify-Access-Token": SHOPIFY_ACCESS_TOKEN,
-    "Content-Type": "application/json",
-}
+HEADERS = {}
+
+
+def get_access_token():
+    """Return an Admin API token.
+
+    Preferred: mint a fresh token each run via the client credentials grant using
+    the app's permanent Client ID + Client secret, so no token ever needs to be
+    created or rotated by hand. Falls back to a static SHOPIFY_ACCESS_TOKEN if set.
+    """
+    if SHOPIFY_ACCESS_TOKEN:
+        return SHOPIFY_ACCESS_TOKEN
+    if not (SHOPIFY_CLIENT_ID and SHOPIFY_CLIENT_SECRET):
+        print("ERROR: set SHOPIFY_ACCESS_TOKEN, or SHOPIFY_CLIENT_ID + SHOPIFY_CLIENT_SECRET")
+        sys.exit(1)
+    res = requests.post(
+        "https://%s/admin/oauth/access_token" % SHOPIFY_STORE_DOMAIN,
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+        data={
+            "grant_type": "client_credentials",
+            "client_id": SHOPIFY_CLIENT_ID,
+            "client_secret": SHOPIFY_CLIENT_SECRET,
+        },
+        timeout=60,
+    )
+    if res.status_code != 200:
+        print("ERROR fetching access token: %s %s" % (res.status_code, res.text[:300]))
+        sys.exit(1)
+    token = res.json().get("access_token")
+    if not token:
+        print("ERROR: token endpoint returned no access_token")
+        sys.exit(1)
+    return token
 
 
 def normalize(name):
@@ -107,6 +138,12 @@ def detect_location_id(inventory_item_id):
     return None
 
 
+def enable_tracking(inventory_item_id):
+    url = "%s/inventory_items/%s.json" % (BASE, inventory_item_id)
+    res = requests.put(url, headers=HEADERS, json={"inventory_item": {"tracked": True}}, timeout=60)
+    return res.status_code == 200
+
+
 def get_current_levels(location_id):
     levels = {}
     url = "%s/inventory_levels.json?location_ids=%s&limit=250" % (BASE, location_id)
@@ -144,6 +181,10 @@ def main():
     if DRY_RUN:
         print("DRY RUN enabled: no writes will be performed")
 
+    HEADERS["X-Shopify-Access-Token"] = get_access_token()
+    HEADERS["Content-Type"] = "application/json"
+    print("Authenticated with Shopify Admin API")
+
     shopify_products, duplicates = get_shopify_products()
     print("Shopify products: %d unique titles (%d duplicate titles skipped)" % (len(shopify_products), duplicates))
 
@@ -159,8 +200,6 @@ def main():
 
     location_id = None
     for key in matched:
-        if not shopify_products[key]["tracked"]:
-            continue
         location_id = detect_location_id(shopify_products[key]["inventory_item_id"])
         if location_id:
             break
@@ -171,23 +210,33 @@ def main():
 
     current = get_current_levels(location_id)
 
-    updated = unchanged = untracked = failed = 0
+    updated = unchanged = tracking_enabled = failed = 0
     failures = []
 
     for key, qty in matched.items():
         info = shopify_products[key]
-        if not info["tracked"]:
-            continue
-        item_id = shopify_products[key]["inventory_item_id"]
+        item_id = info["inventory_item_id"]
+        need_track = not info["tracked"]
 
-        if current is not None and int(current.get(item_id, None) or 0) == qty and item_id in current:
+        if not need_track and current is not None and item_id in current and int(current.get(item_id) or 0) == qty:
             unchanged += 1
             continue
 
         if DRY_RUN:
-            print("[DRY] %r -> %d" % (key, qty))
+            print("[DRY] %r -> %d%s" % (key, qty, " (+ enable tracking)" if need_track else ""))
             updated += 1
+            if need_track:
+                tracking_enabled += 1
             continue
+
+        if need_track:
+            if not enable_tracking(item_id):
+                failed += 1
+                failures.append((key, "tracking", "could not enable inventory tracking"))
+                time.sleep(WRITE_DELAY)
+                continue
+            tracking_enabled += 1
+            time.sleep(WRITE_DELAY)
 
         ok, status, body = set_inventory(location_id, inventory_item_id=item_id, qty=qty)
         if ok:
@@ -197,14 +246,13 @@ def main():
             failures.append((key, status, body))
         time.sleep(WRITE_DELAY)
 
-    untracked = sum(1 for k, v in server_inventory.items() if k in shopify_products and not shopify_products[k]["tracked"])
     unmatched = len(server_inventory) - len(shopify_products.keys() & server_inventory.keys())
 
     print("\n================ SYNC SUMMARY ================")
     print("matched            : %d" % len(matched))
     print("updated            : %d" % updated)
+    print("tracking enabled   : %d" % tracking_enabled)
     print("already correct    : %d" % unchanged)
-    print("untracked (skipped): %d" % untracked)
     print("skipped unmatched  : %d" % unmatched)
     print("failed             : %d" % failed)
     if failures:
