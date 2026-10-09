@@ -2,12 +2,22 @@ name: Pharmacy Shopify Inventory Sync
 
 on:
   schedule:
-    - cron: '*/30 * * * *'  # Runs automatically every 30 minutes
+    - cron: '*/30 * * * *'  # every 30 minutes
   workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Preview changes without writing (true/false)'
+        required: false
+        default: 'false'
+
+concurrency:
+  group: shopify-inventory-sync
+  cancel-in-progress: false
 
 jobs:
   sync:
     runs-on: ubuntu-latest
+    timeout-minutes: 90
 
     steps:
       - name: Checkout Code
@@ -19,10 +29,11 @@ jobs:
           python-version: '3.11'
 
       - name: Install Dependencies
-        run: pip install requests
+        run: pip install "requests==2.32.3"
 
       - name: Run Inventory Sync
         env:
           SHOPIFY_ACCESS_TOKEN: ${{ secrets.SHOPIFY_ACCESS_TOKEN }}
           SHOPIFY_STORE_DOMAIN: ${{ secrets.SHOPIFY_STORE_DOMAIN }}
+          DRY_RUN: ${{ github.event.inputs.dry_run || 'false' }}
         run: python sync.py
