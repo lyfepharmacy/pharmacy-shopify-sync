@@ -2,7 +2,7 @@ name: Pharmacy Shopify Inventory Sync
 
 on:
   schedule:
-    - cron: '*/59 * * * *'  # every hour
+    - cron: '*/0 * * * *'  # every hour
   workflow_dispatch:
     inputs:
       dry_run:
@@ -17,7 +17,7 @@ concurrency:
 jobs:
   sync:
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    timeout-minutes: 180
 
     steps:
       - name: Checkout Code
@@ -33,7 +33,8 @@ jobs:
 
       - name: Run Inventory Sync
         env:
-          SHOPIFY_ACCESS_TOKEN: ${{ secrets.SHOPIFY_ACCESS_TOKEN }}
           SHOPIFY_STORE_DOMAIN: ${{ secrets.SHOPIFY_STORE_DOMAIN }}
+          SHOPIFY_CLIENT_ID: ${{ secrets.SHOPIFY_CLIENT_ID }}
+          SHOPIFY_CLIENT_SECRET: ${{ secrets.SHOPIFY_CLIENT_SECRET }}
           DRY_RUN: ${{ github.event.inputs.dry_run || 'false' }}
         run: python sync.py
