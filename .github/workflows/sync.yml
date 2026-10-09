@@ -1,0 +1,40 @@
+name: Pharmacy Shopify Inventory Sync
+
+on:
+  schedule:
+    - cron: '*/59 * * * *'  # every hour
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Preview changes without writing (true/false)'
+        required: false
+        default: 'false'
+
+concurrency:
+  group: shopify-inventory-sync
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v5
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+
+      - name: Install Dependencies
+        run: pip install "requests==2.32.3"
+
+      - name: Run Inventory Sync
+        env:
+          SHOPIFY_STORE_DOMAIN: ${{ secrets.SHOPIFY_STORE_DOMAIN }}
+          SHOPIFY_CLIENT_ID: ${{ secrets.SHOPIFY_CLIENT_ID }}
+          SHOPIFY_CLIENT_SECRET: ${{ secrets.SHOPIFY_CLIENT_SECRET }}
+          DRY_RUN: ${{ github.event.inputs.dry_run || 'false' }}
+        run: python sync.py
