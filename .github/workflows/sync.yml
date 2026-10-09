@@ -2,7 +2,7 @@ name: Pharmacy Shopify Inventory Sync
 
 on:
   schedule:
-    - cron: '*/30 * * * *'  # every 30 minutes
+    - cron: '*/0 * * * *'  # every hour
   workflow_dispatch:
     inputs:
       dry_run:
@@ -21,10 +21,10 @@ jobs:
 
     steps:
       - name: Checkout Code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: '3.11'
 
