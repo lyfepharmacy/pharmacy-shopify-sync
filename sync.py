@@ -113,9 +113,22 @@ def get_shopify_products():
 
 
 def get_server_inventory():
-    res = requests.get(API_URL, timeout=60)
-    res.raise_for_status()
-    data = res.json()
+    try:
+        res = requests.get(API_URL, timeout=60)
+        res.raise_for_status()
+        data = res.json()
+    except (requests.exceptions.RequestException, ValueError) as e:
+        print("")
+        print("==============================================================")
+        print("SERVER IS OFFLINE: could not reach the inventory API.")
+        print("  URL  : %s" % API_URL)
+        print("  Reason: %s" % e)
+        print("  NOTE : Please check that the server API is running and")
+        print("         reachable. The next run will pick up the sync")
+        print("         automatically once the server is back online.")
+        print("==============================================================")
+        print("")
+        sys.exit(0)
     rows = data[0].get("locationWiseProductInventoryDetail", []) if isinstance(data, list) and data else []
     inventory = {}
     for r in rows:
@@ -185,14 +198,14 @@ def main():
     HEADERS["Content-Type"] = "application/json"
     print("Authenticated with Shopify Admin API")
 
-    shopify_products, duplicates = get_shopify_products()
-    print("Shopify products: %d unique titles (%d duplicate titles skipped)" % (len(shopify_products), duplicates))
-
     server_inventory = get_server_inventory()
     print("Server inventory (LocationId 1): %d unique products" % len(server_inventory))
     if not server_inventory:
-        print("ERROR: no server data returned; aborting")
+        print("ERROR: server API returned no data; aborting")
         sys.exit(1)
+
+    shopify_products, duplicates = get_shopify_products()
+    print("Shopify products: %d unique titles (%d duplicate titles skipped)" % (len(shopify_products), duplicates))
 
     matched = {k: v for k, v in server_inventory.items() if k in shopify_products}
     unmatched = len(server_inventory) - len(matched)
