@@ -1,67 +1,38 @@
 import os
+import re
+import sys
+import time
+
 import requests
-import json
 
 SHOPIFY_ACCESS_TOKEN = os.environ.get("SHOPIFY_ACCESS_TOKEN")
 SHOPIFY_STORE_DOMAIN = os.environ.get("SHOPIFY_STORE_DOMAIN")
 API_URL = "http://137.59.222.96:8085/myapi/LocationWiseProductInventory"
 
+API_VERSION = "2024-01"
+WRITE_DELAY = 0.5
+DRY_RUN = os.environ.get("DRY_RUN", "").strip().lower() in ("1", "true", "yes")
+
 if not SHOPIFY_ACCESS_TOKEN or not SHOPIFY_STORE_DOMAIN:
-    print("ERROR: SHOPIFY_ACCESS_TOKEN or SHOPIFY_STORE_DOMAIN environment variables are missing!")
-    exit(1)
+    print("ERROR: SHOPIFY_ACCESS_TOKEN or SHOPIFY_STORE_DOMAIN environment variables are missing")
+    sys.exit(1)
 
 SHOPIFY_STORE_DOMAIN = SHOPIFY_STORE_DOMAIN.replace("https://", "").replace("http://", "").strip("/")
-
+BASE = "https://%s/admin/api/%s" % (SHOPIFY_STORE_DOMAIN, API_VERSION)
 HEADERS = {
     "X-Shopify-Access-Token": SHOPIFY_ACCESS_TOKEN,
-    "Content-Type": "application/json"
+    "Content-Type": "application/json",
 }
 
-# Auto-detected location cache
-CACHED_LOCATION_ID = None
 
-def get_all_shopify_products():
-    products = {}
-    url = f"https://{SHOPIFY_STORE_DOMAIN}/admin/api/2024-01/products.json?limit=250"
-    
-    while url:
-        res = requests.get(url, headers=HEADERS)
-        if res.status_code != 200:
-            print(f"Error fetching Shopify products: {res.text}")
-            break
+def normalize(name):
+    """Case-insensitive, whitespace-collapsed key (handles the &nbsp; seen on the site)."""
+    if name is None:
+        return ""
+    name = str(name).replace("\u00a0", " ")
+    name = re.sub(r"\s+", " ", name)
+    return name.strip().lower()
 
-        data = res.json()
-        for p in data.get('products', []):
-            clean_title = p['title'].strip().lower()
-            if p.get('variants'):
-                variant = p['variants'][0]
-                products[clean_title] = {
-                    'product_id': p['id'],
-                    'variant_id': variant['id'],
-                    'inventory_item_id': variant['inventory_item_id']
-                }
-        
-        link_header = res.headers.get('Link', '')
-        url = None
-        if 'rel="next"' in link_header:
-            links = link_header.split(',')
-            for link in links:
-                if 'rel="next"' in link:
-                    url = link.split(';')[0].strip('<> ')
-
-    return products
-
-def get_pharmacy_data():
-    try:
-        res = requests.get(API_URL, timeout=30)
-        res.raise_for_status()
-        data = res.json()
-        if isinstance(data, list) and len(data) > 0:
-            return data[0].get('locationWiseProductInventoryDetail', [])
-        return []
-    except Exception as e:
-        print(f"Error fetching data from Pharmacy API: {e}")
-        return []
 
 def parse_qty(val):
     try:
@@ -69,103 +40,182 @@ def parse_qty(val):
     except (ValueError, TypeError):
         return 0
 
-def update_stock(inventory_item_id, qty):
-    global CACHED_LOCATION_ID
 
-    # Auto-detect location ID directly from existing item (uses read_inventory scope)
-    if not CACHED_LOCATION_ID:
-        inv_url = f"https://{SHOPIFY_STORE_DOMAIN}/admin/api/2024-01/inventory_levels.json?inventory_item_ids={inventory_item_id}"
-        inv_res = requests.get(inv_url, headers=HEADERS)
-        if inv_res.status_code == 200:
-            levels = inv_res.json().get('inventory_levels', [])
-            if levels:
-                CACHED_LOCATION_ID = levels[0]['location_id']
+def next_page_url(res):
+    link = res.headers.get("Link", "")
+    if 'rel="next"' not in link:
+        return None
+    for part in link.split(","):
+        if 'rel="next"' in part:
+            return part.split(";")[0].strip().strip("<> ")
+    return None
 
-    if not CACHED_LOCATION_ID:
-        print(f"Could not update inventory for item {inventory_item_id}: Location not found.")
-        return
 
-    url = f"https://{SHOPIFY_STORE_DOMAIN}/admin/api/2024-01/inventory_levels/set.json"
+def get_shopify_products():
+    products = {}
+    duplicates = 0
+    url = "%s/products.json?limit=250" % BASE
+    while url:
+        res = requests.get(url, headers=HEADERS, timeout=60)
+        if res.status_code != 200:
+            print("ERROR fetching Shopify products: %s %s" % (res.status_code, res.text[:300]))
+            sys.exit(1)
+        for p in res.json().get("products", []):
+            key = normalize(p.get("title"))
+            if not key:
+                continue
+            variants = p.get("variants") or []
+            if not variants:
+                continue
+            v = variants[0]
+            if key in products:
+                duplicates += 1
+                continue
+            products[key] = {
+                "product_id": p.get("id"),
+                "variant_id": v.get("id"),
+                "inventory_item_id": v.get("inventory_item_id"),
+                "tracked": v.get("inventory_management") == "shopify",
+            }
+        url = next_page_url(res)
+    return products, duplicates
+
+
+def get_server_inventory():
+    res = requests.get(API_URL, timeout=60)
+    res.raise_for_status()
+    data = res.json()
+    rows = data[0].get("locationWiseProductInventoryDetail", []) if isinstance(data, list) and data else []
+    inventory = {}
+    for r in rows:
+        if str(r.get("LocationId", "")).strip() != "1":
+            continue
+        key = normalize(r.get("ProductName"))
+        if not key:
+            continue
+        inventory[key] = parse_qty(r.get("LocationStock", "0"))
+    return inventory
+
+
+def detect_location_id(inventory_item_id):
+    url = "%s/inventory_levels.json?inventory_item_ids=%s" % (BASE, inventory_item_id)
+    res = requests.get(url, headers=HEADERS, timeout=60)
+    if res.status_code == 200:
+        levels = res.json().get("inventory_levels", [])
+        if levels:
+            return levels[0]["location_id"]
+    return None
+
+
+def get_current_levels(location_id):
+    levels = {}
+    url = "%s/inventory_levels.json?location_ids=%s&limit=250" % (BASE, location_id)
+    while url:
+        res = requests.get(url, headers=HEADERS, timeout=60)
+        if res.status_code != 200:
+            print("WARNING: could not pre-read inventory levels (%s); will write every matched item." % res.status_code)
+            return None
+        for lv in res.json().get("inventory_levels", []):
+            levels[lv["inventory_item_id"]] = lv.get("available", 0)
+        url = next_page_url(res)
+    return levels
+
+
+def set_inventory(location_id, inventory_item_id, qty):
     payload = {
-        "location_id": CACHED_LOCATION_ID,
+        "location_id": location_id,
         "inventory_item_id": inventory_item_id,
-        "available": parse_qty(qty)
+        "available": qty,
     }
-    requests.post(url, headers=HEADERS, json=payload)
+    for _ in range(4):
+        res = requests.post("%s/inventory_levels/set.json" % BASE, headers=HEADERS, json=payload, timeout=60)
+        if res.status_code == 429:
+            wait = float(res.headers.get("Retry-After", "2"))
+            time.sleep(max(wait, 2.0))
+            continue
+        if res.status_code in (200, 201):
+            return True, res.status_code, ""
+        return False, res.status_code, res.text[:200]
+    return False, 429, "rate limited"
 
-def create_draft_product(item):
-    url = f"https://{SHOPIFY_STORE_DOMAIN}/admin/api/2024-01/products.json"
-    stock_qty = parse_qty(item.get('LocationStock', 0))
-    price = str(item.get('ProductSalePrice', '0.00')).strip()
-    
-    payload = {
-        "product": {
-            "title": item['ProductName'].strip(),
-            "status": "draft",
-            "tags": "NEW_FROM_API",
-            "variants": [
-                {
-                    "price": price if price else "0.00",
-                    "inventory_quantity": stock_qty,
-                    "inventory_management": "shopify"
-                }
-            ]
-        }
-    }
-    res = requests.post(url, headers=HEADERS, json=payload)
-    return res.status_code == 201
 
 def main():
-    print("--- STARTING PHARMACY TO SHOPIFY SYNC ---")
+    print("=== LYFE Shopify Inventory Sync ===")
+    if DRY_RUN:
+        print("DRY RUN enabled: no writes will be performed")
 
-    # 1. Fetch Existing Shopify Products
-    shopify_products = get_all_shopify_products()
-    print(f" Loaded {len(shopify_products)} existing products from Shopify.")
+    shopify_products, duplicates = get_shopify_products()
+    print("Shopify products: %d unique titles (%d duplicate titles skipped)" % (len(shopify_products), duplicates))
 
-    # 2. Fetch Pharmacy API Items
-    pharmacy_items = get_pharmacy_data()
-    print(f" Fetched {len(pharmacy_items)} product records from Pharmacy API.")
+    server_inventory = get_server_inventory()
+    print("Server inventory (LocationId 1): %d unique products" % len(server_inventory))
+    if not server_inventory:
+        print("ERROR: no server data returned; aborting")
+        sys.exit(1)
 
-    if not pharmacy_items:
-        print("⚠ Warning: No data returned from Pharmacy API or connection failed.")
-        return
+    matched = {k: v for k, v in server_inventory.items() if k in shopify_products}
+    unmatched = len(server_inventory) - len(matched)
+    print("Matched to website: %d  |  Unmatched (skipped): %d" % (len(matched), unmatched))
 
-    updated_count = 0
-    created_count = 0
-    new_products_list = []
+    location_id = None
+    for key in matched:
+        if not shopify_products[key]["tracked"]:
+            continue
+        location_id = detect_location_id(shopify_products[key]["inventory_item_id"])
+        if location_id:
+            break
+    if not location_id:
+        print("ERROR: could not determine inventory location id; aborting")
+        sys.exit(1)
+    print("Using location_id: %s" % location_id)
 
-    # 3. Process Sync (Filtered for HEAD OFFICE / LocationId 1)
-    for item in pharmacy_items:
-        if str(item.get('LocationId', '')).strip() != "1":
+    current = get_current_levels(location_id)
+
+    updated = unchanged = untracked = failed = 0
+    failures = []
+
+    for key, qty in matched.items():
+        info = shopify_products[key]
+        if not info["tracked"]:
+            continue
+        item_id = shopify_products[key]["inventory_item_id"]
+
+        if current is not None and int(current.get(item_id, None) or 0) == qty and item_id in current:
+            unchanged += 1
             continue
 
-        name = str(item.get('ProductName', '')).strip()
-        if not name:
+        if DRY_RUN:
+            print("[DRY] %r -> %d" % (key, qty))
+            updated += 1
             continue
 
-        clean_name = name.lower()
-        stock = item.get('LocationStock', '0')
-
-        if clean_name in shopify_products:
-            inv_item_id = shopify_products[clean_name]['inventory_item_id']
-            update_stock(inv_item_id, stock)
-            updated_count += 1
+        ok, status, body = set_inventory(location_id, inventory_item_id=item_id, qty=qty)
+        if ok:
+            updated += 1
         else:
-            success = create_draft_product(item)
-            if success:
-                created_count += 1
-                new_products_list.append(name)
-                shopify_products[clean_name] = {}
+            failed += 1
+            failures.append((key, status, body))
+        time.sleep(WRITE_DELAY)
+
+    untracked = sum(1 for k, v in server_inventory.items() if k in shopify_products and not shopify_products[k]["tracked"])
+    unmatched = len(server_inventory) - len(shopify_products.keys() & server_inventory.keys())
 
     print("\n================ SYNC SUMMARY ================")
-    print(f" Successfully updated stock for: {updated_count} products.")
-    print(f" Created as draft: {created_count} new products.")
-    
-    if new_products_list:
-        print("\nNew Draft Products Added to Shopify:")
-        for prod in new_products_list:
-            print(f" - {prod}")
-    print("==============================================")
+    print("matched            : %d" % len(matched))
+    print("updated            : %d" % updated)
+    print("already correct    : %d" % unchanged)
+    print("untracked (skipped): %d" % untracked)
+    print("skipped unmatched  : %d" % unmatched)
+    print("failed             : %d" % failed)
+    if failures:
+        print("--- failures (first 50) ---")
+        for key, status, body in failures[:50]:
+            print("  %r -> HTTP %s: %s" % (key, status, body))
+    print("=============================================")
+
+    if failed:
+        sys.exit(1)
+
 
 if __name__ == "__main__":
     main()
