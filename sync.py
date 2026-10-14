@@ -5,7 +5,6 @@ import time
 
 import requests
 
-SHOPIFY_ACCESS_TOKEN = os.environ.get("SHOPIFY_ACCESS_TOKEN")
 SHOPIFY_CLIENT_ID = os.environ.get("SHOPIFY_CLIENT_ID")
 SHOPIFY_CLIENT_SECRET = os.environ.get("SHOPIFY_CLIENT_SECRET")
 SHOPIFY_STORE_DOMAIN = os.environ.get("SHOPIFY_STORE_DOMAIN")
@@ -13,7 +12,18 @@ API_URL = "http://137.59.222.96:8085/myapi/LocationWiseProductInventory"
 
 API_VERSION = "2024-01"
 WRITE_DELAY = 0.5
+PRICE_MULTIPLIER = 1.10
 DRY_RUN = os.environ.get("DRY_RUN", "").strip().lower() in ("1", "true", "yes")
+
+CATEGORY_ALIASES = {
+    "cosmaceuticals": "cosmeceuticals",
+    "neutraceutical": "nutraceutical",
+    "nutritional & health supplement": "nutritional health and supplements",
+    "nutritional and health supplement": "nutritional health and supplements",
+    "food & drinks": "food and drinks",
+    "devices & appliances": "devices and appliances",
+}
+SKIP_CATEGORIES = {"defaultcategory", "candy", "ice cream", "general", "homoeopathic"}
 
 if not SHOPIFY_STORE_DOMAIN:
     print("ERROR: SHOPIFY_STORE_DOMAIN environment variable is missing")
@@ -25,16 +35,13 @@ HEADERS = {}
 
 
 def get_access_token():
-    """Return an Admin API token.
+    """Mint a fresh Admin API token each run via the client credentials grant.
 
-    Preferred: mint a fresh token each run via the client credentials grant using
-    the app's permanent Client ID + Client secret, so no token ever needs to be
-    created or rotated by hand. Falls back to a static SHOPIFY_ACCESS_TOKEN if set.
+    Uses the app's Client ID + Client Secret, so no token needs to be created
+    or rotated by hand.
     """
-    if SHOPIFY_ACCESS_TOKEN:
-        return SHOPIFY_ACCESS_TOKEN
     if not (SHOPIFY_CLIENT_ID and SHOPIFY_CLIENT_SECRET):
-        print("ERROR: set SHOPIFY_ACCESS_TOKEN, or SHOPIFY_CLIENT_ID + SHOPIFY_CLIENT_SECRET")
+        print("ERROR: set SHOPIFY_CLIENT_ID and SHOPIFY_CLIENT_SECRET")
         sys.exit(1)
     res = requests.post(
         "https://%s/admin/oauth/access_token" % SHOPIFY_STORE_DOMAIN,
@@ -72,6 +79,13 @@ def parse_qty(val):
         return 0
 
 
+def parse_price(val):
+    try:
+        return round(float(str(val).strip()), 2)
+    except (ValueError, TypeError):
+        return 0.0
+
+
 def next_page_url(res):
     link = res.headers.get("Link", "")
     if 'rel="next"' not in link:
@@ -107,9 +121,48 @@ def get_shopify_products():
                 "variant_id": v.get("id"),
                 "inventory_item_id": v.get("inventory_item_id"),
                 "tracked": v.get("inventory_management") == "shopify",
+                "price": v.get("price"),
             }
         url = next_page_url(res)
     return products, duplicates
+
+
+def get_collections():
+    index = {}
+    url = "%s/custom_collections.json?limit=250" % BASE
+    while url:
+        res = requests.get(url, headers=HEADERS, timeout=60)
+        if res.status_code != 200:
+            print("WARNING: could not read collections (%s); category sync will be skipped." % res.status_code)
+            return None
+        for c in res.json().get("custom_collections", []):
+            key = normalize(c.get("title"))
+            if key and key not in index:
+                index[key] = c.get("id")
+        url = next_page_url(res)
+    return index
+
+
+def get_collects():
+    membership = {}
+    url = "%s/collects.json?limit=250" % BASE
+    while url:
+        res = requests.get(url, headers=HEADERS, timeout=60)
+        if res.status_code != 200:
+            print("WARNING: could not read collection memberships (%s); adds will be attempted blindly." % res.status_code)
+            return None
+        for c in res.json().get("collects", []):
+            membership.setdefault(c.get("product_id"), set()).add(c.get("collection_id"))
+        url = next_page_url(res)
+    return membership
+
+
+def resolve_collection_id(category, collections):
+    key = normalize(category)
+    if not key or key in SKIP_CATEGORIES:
+        return None
+    key = CATEGORY_ALIASES.get(key, key)
+    return collections.get(key)
 
 
 def get_server_inventory():
@@ -137,7 +190,11 @@ def get_server_inventory():
         key = normalize(r.get("ProductName"))
         if not key:
             continue
-        inventory[key] = parse_qty(r.get("LocationStock", "0"))
+        inventory[key] = {
+            "qty": parse_qty(r.get("LocationStock", "0")),
+            "price": parse_price(r.get("ProductSalePrice")),
+            "category": r.get("Category"),
+        }
     return inventory
 
 
@@ -189,7 +246,36 @@ def set_inventory(location_id, inventory_item_id, qty):
     return False, 429, "rate limited"
 
 
+def set_variant_price(variant_id, price_str):
+    payload = {"variant": {"id": variant_id, "price": price_str}}
+    for _ in range(4):
+        res = requests.put("%s/variants/%s.json" % (BASE, variant_id), headers=HEADERS, json=payload, timeout=60)
+        if res.status_code == 429:
+            wait = float(res.headers.get("Retry-After", "2"))
+            time.sleep(max(wait, 2.0))
+            continue
+        if res.status_code == 200:
+            return True, res.status_code, ""
+        return False, res.status_code, res.text[:200]
+    return False, 429, "rate limited"
+
+
+def add_to_collection(collection_id, product_id):
+    payload = {"collect": {"collection_id": collection_id, "product_id": product_id}}
+    for _ in range(4):
+        res = requests.post("%s/collects.json" % BASE, headers=HEADERS, json=payload, timeout=60)
+        if res.status_code == 429:
+            wait = float(res.headers.get("Retry-After", "2"))
+            time.sleep(max(wait, 2.0))
+            continue
+        if res.status_code in (200, 201):
+            return True, res.status_code, ""
+        return False, res.status_code, res.text[:200]
+    return False, 429, "rate limited"
+
+
 def main():
+
     print("=== LYFE Shopify Inventory Sync ===")
     if DRY_RUN:
         print("DRY RUN enabled: no writes will be performed")
@@ -207,9 +293,15 @@ def main():
     shopify_products, duplicates = get_shopify_products()
     print("Shopify products: %d unique titles (%d duplicate titles skipped)" % (len(shopify_products), duplicates))
 
+    collections = get_collections()
+    if collections is None:
+        print("Category sync disabled (collections unavailable)")
+    else:
+        print("Shopify collections: %d" % len(collections))
+    membership = get_collects() if collections is not None else None
+
     matched = {k: v for k, v in server_inventory.items() if k in shopify_products}
-    unmatched = len(server_inventory) - len(matched)
-    print("Matched to website: %d  |  Unmatched (skipped): %d" % (len(matched), unmatched))
+    print("Matched to website: %d  |  Unmatched (skipped): %d" % (len(matched), len(server_inventory) - len(matched)))
 
     location_id = None
     for key in matched:
@@ -224,50 +316,119 @@ def main():
     current = get_current_levels(location_id)
 
     updated = unchanged = tracking_enabled = failed = 0
+    price_updated = price_unchanged = price_skipped = 0
+    collect_added = collect_unchanged = collect_skipped = 0
     failures = []
 
-    for key, qty in matched.items():
+    for key, data in matched.items():
         info = shopify_products[key]
         item_id = info["inventory_item_id"]
+        qty = data["qty"]
         need_track = not info["tracked"]
+        stock_same = (
+            not need_track
+            and current is not None
+            and item_id in current
+            and int(current.get(item_id) or 0) == qty
+        )
 
-        if not need_track and current is not None and item_id in current and int(current.get(item_id) or 0) == qty:
+        target_price = None
+        if data["price"] > 0:
+            target_price = round(data["price"] * PRICE_MULTIPLIER, 2)
+        if target_price is None:
+            price_state = "skip"
+        else:
+            try:
+                cur_price = round(float(info["price"]), 2)
+            except (ValueError, TypeError):
+                cur_price = None
+            price_state = "same" if cur_price == target_price else "change"
+
+        target_collection = resolve_collection_id(data["category"], collections) if collections is not None else None
+        if collections is None or target_collection is None:
+            collect_state = "skip"
+        elif membership is not None and target_collection in membership.get(info["product_id"], set()):
+            collect_state = "same"
+        else:
+            collect_state = "add"
+
+        if stock_same:
             unchanged += 1
-            continue
-
-        if DRY_RUN:
-            print("[DRY] %r -> %d%s" % (key, qty, " (+ enable tracking)" if need_track else ""))
+        elif DRY_RUN:
             updated += 1
             if need_track:
                 tracking_enabled += 1
-            continue
-
-        if need_track:
-            if not enable_tracking(item_id):
-                failed += 1
-                failures.append((key, "tracking", "could not enable inventory tracking"))
+            print("[DRY] stock %r -> %d%s" % (key, qty, " (+ enable tracking)" if need_track else ""))
+        else:
+            ok = True
+            if need_track:
+                if enable_tracking(item_id):
+                    tracking_enabled += 1
+                else:
+                    ok = False
+                    failed += 1
+                    failures.append((key, "tracking", "could not enable inventory tracking"))
                 time.sleep(WRITE_DELAY)
-                continue
-            tracking_enabled += 1
+            if ok:
+                set_ok, status, body = set_inventory(location_id, item_id, qty)
+                if set_ok:
+                    updated += 1
+                else:
+                    failed += 1
+                    failures.append((key, status, body))
+                time.sleep(WRITE_DELAY)
+
+        if price_state == "skip":
+            price_skipped += 1
+        elif price_state == "same":
+            price_unchanged += 1
+        elif DRY_RUN:
+            price_updated += 1
+            print("[DRY] price %r -> %.2f" % (key, target_price))
+        else:
+            price_ok, status, body = set_variant_price(info["variant_id"], "%.2f" % target_price)
+            if price_ok:
+                price_updated += 1
+            else:
+                failed += 1
+                failures.append((key, status, body))
             time.sleep(WRITE_DELAY)
 
-        ok, status, body = set_inventory(location_id, inventory_item_id=item_id, qty=qty)
-        if ok:
-            updated += 1
+        if collect_state == "skip":
+            collect_skipped += 1
+        elif collect_state == "same":
+            collect_unchanged += 1
+        elif DRY_RUN:
+            collect_added += 1
+            print("[DRY] collect %r -> %s" % (key, target_collection))
         else:
-            failed += 1
-            failures.append((key, status, body))
-        time.sleep(WRITE_DELAY)
+            add_ok, status, body = add_to_collection(target_collection, info["product_id"])
+            if add_ok:
+                collect_added += 1
+            else:
+                failed += 1
+                failures.append((key, status, body))
+            time.sleep(WRITE_DELAY)
 
     unmatched = len(server_inventory) - len(shopify_products.keys() & server_inventory.keys())
 
     print("\n================ SYNC SUMMARY ================")
     print("matched            : %d" % len(matched))
-    print("updated            : %d" % updated)
-    print("tracking enabled   : %d" % tracking_enabled)
-    print("already correct    : %d" % unchanged)
-    print("skipped unmatched  : %d" % unmatched)
-    print("failed             : %d" % failed)
+    print("-- stock --")
+    print("  updated          : %d" % updated)
+    print("  tracking enabled : %d" % tracking_enabled)
+    print("  already correct  : %d" % unchanged)
+    print("-- price (x1.10) --")
+    print("  updated          : %d" % price_updated)
+    print("  already correct  : %d" % price_unchanged)
+    print("  skipped (no price): %d" % price_skipped)
+    print("-- collections --")
+    print("  added            : %d" % collect_added)
+    print("  already member   : %d" % collect_unchanged)
+    print("  skipped (no coll): %d" % collect_skipped)
+    print("-- other --")
+    print("  skipped unmatched: %d" % unmatched)
+    print("  failed           : %d" % failed)
     if failures:
         print("--- failures (first 50) ---")
         for key, status, body in failures[:50]:
